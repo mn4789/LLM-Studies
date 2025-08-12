@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 
 import time
 import tiktoken
+import math
 from dataclasses import dataclass
 
 from model_gpt2 import GPT2Model, GPTConfig
@@ -24,6 +25,56 @@ class TrainArgs:
     grad_accum_steps = 8
     amp = True if torch.cuda.is_available() else False
     amp_dtype = torch.float16
+    # Optimizer and Scheduler Hyperparameters
+    learning_rate = 3e-4
+    weight_decay = 0.1
+    betas = (0.9, 0.95)
+    eps = 1e-8
+    # Cosine Schedule with warmup
+    max_lr = 3e-4
+    min_lr = 3e-5
+    warmup_steps = 500
+
+
+def configure_optimizers(model: nn.Module, weight_decay: float, learning_rate: float,
+                         betas: tuple[float, float], eps: float) -> torch.optim.Optimizer:
+    # start with all of the candidate parameters (that require grad)
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+    # any parameter with dim >= 2 gets weight decay (matmuls, embeddings)
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': nodecay_params, 'weight_decay': 0.0},
+    ]
+
+    num_decay_params = sum(p.numel() for p in decay_params)
+    num_nodecay_params = sum(p.numel() for p in nodecay_params)
+    print(
+        f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+    print(
+        f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+
+    optimizer = torch.optim.AdamW(
+        optim_groups, lr=learning_rate, betas=betas, eps=eps
+    )
+    return optimizer
+
+
+def get_cosine_lr(it, *, warmup_steps, max_steps, max_lr, min_lr):
+    # 1) linear warmup for warmup_steps steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / max(warmup_steps, 1)
+    # 2) if it >= max_steps, return min learning rate
+    if it >= max_steps:
+        return min_lr
+    # 3) cosine decay between warmup_steps and max_steps
+    decay_ratio = (it - warmup_steps) / max(1, (max_steps - warmup_steps))
+    decay_ratio = min(max(decay_ratio, 0.0), 1.0)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # 1 -> 0
+    return min_lr + coeff * (max_lr - min_lr)
 
 
 def train_step(model: nn.Module, input: torch.Tensor, target: torch.Tensor,
@@ -41,15 +92,28 @@ def train_step(model: nn.Module, input: torch.Tensor, target: torch.Tensor,
         loss = loss / gradient_accumulation_steps
     # loss.backward()
     scaler.scale(loss).backward()
+    grad_norm, current_lr = None, None
 
     if (step+1) % gradient_accumulation_steps == 0:
+        # Update LR
+        current_lr = get_cosine_lr(step, warmup_steps=args.warmup_steps,
+                                   max_steps=args.max_iters, max_lr=args.max_lr, min_lr=args.min_lr)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
+
+        # Unscale before clipping
+        # if scaler.is_enabled():
+        scaler.unscale_(optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        # Optimizer and Scaler Step
         # optimizer.step()
         # optimizer.zero_grad()
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-    return loss.detach().item() * gradient_accumulation_steps
+    return loss.detach().item() * gradient_accumulation_steps, grad_norm, current_lr
 
 
 def eval_step(model: nn.Module, input: torch.Tensor, target: torch.Tensor, args: TrainArgs):
@@ -86,8 +150,7 @@ def generate(model, prompt, config: GPTConfig, args: TrainArgs, num_samples=5, m
         with torch.no_grad():
             with torch.amp.autocast(enabled=args.amp, dtype=torch.float16, device_type=args.device):
                 model_inp = inp[:, -config.block_size:]
-
-        out = model(model_inp)
+                out = model(model_inp)
         next_tok_prob = F.softmax(out[:, -1, :], dim=-1)
         next_tok_candidates = torch.topk(next_tok_prob, 50)
         n_indices = torch.multinomial(next_tok_candidates.values, 1)
@@ -136,8 +199,15 @@ if __name__ == "__main__":
 
     model = GPT2Model(config=model_config)
     model.to(device)
-    # model = torch.compile(model)
-    optimizer = AdamW(model.parameters(), lr=3e-4)
+    model = torch.compile(model)
+
+    # optimizer = AdamW(model.parameters(), lr=3e-4)
+
+    optimizer = configure_optimizers(model,
+                                     weight_decay=train_args.weight_decay,
+                                     learning_rate=train_args.learning_rate,
+                                     betas=train_args.betas, eps=train_args.eps)
+
     scaler = torch.amp.GradScaler(enabled=train_args.amp)
     print(f"GradScaler enabled: {scaler.is_enabled()}")
 
@@ -150,7 +220,9 @@ if __name__ == "__main__":
             break
 
         inp, tar = batch
-        loss = train_step(model, inp, tar, optimizer, scaler, train_args, step)
+        loss, grad_norm, current_lr = train_step(model, inp, tar, optimizer,
+                                                 scaler, train_args, step)
+
         if train_args.device == 'cuda' and (step+1) % train_args.grad_accum_steps == 0:
             torch.cuda.synchronize()
         losses.update(loss, batch_size)
@@ -163,11 +235,13 @@ if __name__ == "__main__":
             tokens_processed = train_args.bsz * \
                 model_config.block_size * train_args.grad_accum_steps
             tokens_per_sec = tokens_processed / elapsed
-            print(
-                f"Step: {step+1}, Major Step: {m_step}, \
-                Loss: {losses.val:.4f}/{losses.avg:.4f}, \
-                Time: {elapsed:.2f} secs, Speed: {tokens_per_sec:.2f} tok/sec"
-            )
+
+            print(f"Step {step+1}/{train_args.max_iters} | "
+                  f"Loss: {losses.val:.4f}/{losses.avg:.4f} | "
+                  f"LR: {current_lr:.6f} | "
+                  f"Grad: {grad_norm:.4f} | "
+                  f"Tokens/sec: {tokens_per_sec:.2f} | "
+                  f"Elapsed time: {elapsed:.2f}s")
 
         if (step+1) % eval_interval == 0:
 
@@ -195,7 +269,10 @@ if __name__ == "__main__":
             t5 = time.time()
             dummy_op = generate_fn(
                 model, dummy_inp, model_config, train_args, max_new_tokens=400).cpu().numpy()
-            torch.cuda.synchronize()
+
+            if torch.cuda.is_available() and train_args.device == 'cuda':
+                torch.cuda.synchronize()
+
             t6 = time.time()
             print(tokenizer.decode(dummy_op[0]))
             print(
