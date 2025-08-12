@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+import math
 import os
 import time
 import tiktoken
@@ -29,13 +30,22 @@ from model_gpt2 import GPT2Model, GPTConfig
 class TrainArgs:
     """ Training configuration """
     epochs = 5
-    max_iters = 10000
+    max_iters = 19000  # 38000
     eval_interval = 800
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     bsz = 8
     grad_accum_steps = 32
     amp = True if torch.cuda.is_available() else False
     amp_dtype = torch.float16
+    # Optimizer and Scheduler Hyperparameters
+    learning_rate = 6e-4  # 3e-4*N_gpu
+    weight_decay = 0.1
+    betas = (0.9, 0.95)
+    eps = 1e-8
+    # Cosine Schedule with warmup
+    max_lr = 6e-4  # 3e-4*N_gpu
+    min_lr = 3e-5
+    warmup_steps = 1200  # 2000
 
 
 class AverageMeter:
@@ -55,6 +65,47 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
+def configure_optimizers(model: nn.Module, weight_decay: float, learning_rate: float,
+                         betas: tuple[float, float], eps: float) -> torch.optim.Optimizer:
+    # start with all of the candidate parameters (that require grad)
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+    # any parameter with dim >= 2 gets weight decay (matmuls, embeddings)
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': nodecay_params, 'weight_decay': 0.0},
+    ]
+
+    num_decay_params = sum(p.numel() for p in decay_params)
+    num_nodecay_params = sum(p.numel() for p in nodecay_params)
+    print(
+        f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+    print(
+        f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+
+    optimizer = torch.optim.AdamW(
+        optim_groups, lr=learning_rate, betas=betas, eps=eps
+    )
+    return optimizer
+
+
+def get_cosine_lr(it, *, warmup_steps, max_steps, max_lr, min_lr):
+    # 1) linear warmup for warmup_steps steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / max(warmup_steps, 1)
+    # 2) if it >= max_steps, return min learning rate
+    if it >= max_steps:
+        return min_lr
+    # 3) cosine decay between warmup_steps and max_steps
+    decay_ratio = (it - warmup_steps) / max(1, (max_steps - warmup_steps))
+    decay_ratio = min(max(decay_ratio, 0.0), 1.0)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # 1 -> 0
+    return min_lr + coeff * (max_lr - min_lr)
+
+
 def train_step(model: nn.Module, input: torch.Tensor, target: torch.Tensor,
                optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScaler, args: TrainArgs, step: int):
     input = input.to(args.device)
@@ -70,6 +121,7 @@ def train_step(model: nn.Module, input: torch.Tensor, target: torch.Tensor,
         loss = loss / gradient_accumulation_steps
     # loss.backward()
     scaler.scale(loss).backward()
+    grad_norm, current_lr = None, None
 
     # The following did not improve performance
     # if (step + 1) % gradient_accumulation_steps != 0:
@@ -83,13 +135,24 @@ def train_step(model: nn.Module, input: torch.Tensor, target: torch.Tensor,
         reduced_loss = reduce_loss(loss_tensor)
 
     if (step+1) % gradient_accumulation_steps == 0:
+        # Update LR
+        current_lr = get_cosine_lr(step, warmup_steps=args.warmup_steps,
+                                   max_steps=args.max_iters, max_lr=args.max_lr, min_lr=args.min_lr)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
+
+        # Unscale before clipping
+        scaler.unscale_(optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        # Optimizer and Scaler Step
         # optimizer.step()
         # optimizer.zero_grad()
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-    return reduced_loss
+    return reduced_loss, grad_norm, current_lr
 
 
 def eval_step(model: nn.Module, input: torch.Tensor, target: torch.Tensor, args: TrainArgs):
@@ -156,7 +219,12 @@ if __name__ == "__main__":
         model = torch.compile(model)
         model = DDP(model, device_ids=[local_rank])
 
-        optimizer = AdamW(model.parameters(), lr=3e-4)
+        # optimizer = AdamW(model.parameters(), lr=3e-4)
+        optimizer = configure_optimizers(model,
+                                         weight_decay=train_args.weight_decay,
+                                         learning_rate=train_args.learning_rate,
+                                         betas=train_args.betas, eps=train_args.eps)
+
         scaler = torch.amp.GradScaler(enabled=train_args.amp)
 
         if is_main():
@@ -190,8 +258,8 @@ if __name__ == "__main__":
             if step >= train_args.max_iters:
                 break
 
-            loss = train_step(model, inp, tar, optimizer,
-                              scaler, train_args, step)
+            loss, grad_norm, current_lr = train_step(model, inp, tar, optimizer,
+                                                     scaler, train_args, step)
             train_loss.update(loss, train_args.bsz)
 
             if (step+1) % train_args.grad_accum_steps == 0:
@@ -208,6 +276,8 @@ if __name__ == "__main__":
                     tokens_per_sec = tokens_processed / elapsed
                     print(f"Step {step+1}/{train_args.max_iters} | "
                           f"Loss: {train_loss.val:.4f}/{train_loss.avg:.4f} | "
+                          f"LR: {current_lr:.6f} | "
+                          f"Grad: {grad_norm:.4f} | "
                           f"Tokens/sec: {tokens_per_sec:.2f} | "
                           f"Elapsed time: {elapsed:.2f}s")
 
@@ -233,13 +303,17 @@ if __name__ == "__main__":
                     print("###### SAMPLE GENERATION ############")
                     dummy_inp = torch.zeros((1, 1), dtype=torch.long)
                     t5 = time.time()
-                    dummy_op = generate_fn(
-                        model, dummy_inp, model_config, train_args, max_new_tokens=200).cpu().numpy()
-                    torch.cuda.synchronize()
+                    dummy_op = generate_fn(model, dummy_inp, model_config,
+                                           train_args, max_new_tokens=400).cpu().numpy()
+
+                    if torch.cuda.is_available() and train_args.device == 'cuda':
+                        torch.cuda.synchronize()
+
                     t6 = time.time()
+                    inf_speed = 400/(t6-t5)
                     print(tokenizer.decode(dummy_op[0]))
                     print(
-                        f"Time taken to generate 400 tokens: {t6-t5:.2f} secs")
+                        f"Time taken to generate 400 tokens: {t6-t5:.2f} secs, Tok/sec: {inf_speed:.2f}")
                     print("#################################")
 
         if is_main():
